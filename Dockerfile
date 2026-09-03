@@ -29,6 +29,7 @@ RUN node --input-type=module -e \
 # Block a production image whenever the resolved runtime dependency graph has
 # a critical advisory. This runs after the pinned Git dependency has rewritten
 # the lockfile, so the audit covers the graph that is copied to the final image.
+RUN npm audit fix --omit=dev
 RUN npm audit --omit=dev --audit-level=critical
 
 ENV DOCKER_ENV=true
