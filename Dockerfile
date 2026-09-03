@@ -12,6 +12,12 @@ RUN git clone --depth 1 --branch "${EVOLUTION_TAG}" \
 
 WORKDIR /evolution
 
+# Root lifecycle fix applied to the exact reviewed Evolution commit. The build
+# fails closed if upstream source no longer matches the audited patch context.
+COPY patches/0001-single-flight-whatsapp-lifecycle.patch /tmp/evolution-lifecycle.patch
+RUN git apply --check /tmp/evolution-lifecycle.patch \
+    && git apply /tmp/evolution-lifecycle.patch
+
 # Pin the exact reviewed hotfix commit. It adds handling for
 # companion_reg_refresh and keeps the rest of Evolution API on 2.3.7.
 RUN npm install --save-exact \
@@ -19,6 +25,11 @@ RUN npm install --save-exact \
 
 RUN node --input-type=module -e \
   "import { handleCompanionRegRefresh, makePairingQRRenderer } from 'baileys'; if (typeof handleCompanionRegRefresh !== 'function' || typeof makePairingQRRenderer !== 'function') process.exit(1); console.log('Baileys companion refresh hotfix verified');"
+
+# Block a production image whenever the resolved runtime dependency graph has
+# a critical advisory. This runs after the pinned Git dependency has rewritten
+# the lockfile, so the audit covers the graph that is copied to the final image.
+RUN npm audit --omit=dev --audit-level=critical
 
 ENV DOCKER_ENV=true
 ENV DATABASE_PROVIDER=postgresql
