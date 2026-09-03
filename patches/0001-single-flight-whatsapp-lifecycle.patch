@@ -1,0 +1,266 @@
+diff --git a/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts b/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts
+index 60e857f..8e790b7 100644
+--- a/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts
++++ b/src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts
+@@ -251,6 +251,11 @@ export class BaileysStartupService extends ChannelStartupService {
+   private endSession = false;
+   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
+   private eventProcessingQueue: Promise<void> = Promise.resolve();
++  private connectionAttempt?: Promise<WASocket>;
++  private socketGeneration = 0;
++  private reconnectAttempts = 0;
++  private readonly maxReconnectAttempts = 8;
++  private readonly reconnectBaseDelayMs = 1000;
+ 
+   // Cache TTL constants (in seconds)
+   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
+@@ -331,7 +336,11 @@ export class BaileysStartupService extends ChannelStartupService {
+     };
+   }
+ 
+-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
++  private async connectionUpdate(
++    { qr, connection, lastDisconnect }: Partial<ConnectionState>,
++    generation: number,
++  ) {
++    if (generation !== this.socketGeneration) return;
+     if (qr) {
+       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
+         this.sendDataWebhook(Events.QRCODE_UPDATED, {
+@@ -424,10 +433,36 @@ export class BaileysStartupService extends ChannelStartupService {
+     }
+ 
+     if (connection === 'close') {
+-      const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
+-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+-      if (shouldReconnect) {
++      const statusCode =
++        (lastDisconnect?.error as Boom)?.output?.statusCode ?? DisconnectReason.connectionClosed;
++      const invalidSessionReasons = [
++        DisconnectReason.loggedOut,
++        DisconnectReason.forbidden,
++        DisconnectReason.badSession,
++        DisconnectReason.multideviceMismatch,
++        402,
++        406,
++      ];
++      const connectionWasReplaced = statusCode === DisconnectReason.connectionReplaced;
++      const sessionIsInvalid = invalidSessionReasons.includes(statusCode);
++      const shouldReconnect = !sessionIsInvalid && !connectionWasReplaced;
++      if (shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
++        this.reconnectAttempts += 1;
++        const backoffMs = Math.min(
++          30_000,
++          this.reconnectBaseDelayMs * 2 ** (this.reconnectAttempts - 1),
++        );
++        this.logger.warn({
++          event: 'whatsapp.reconnect.scheduled',
++          instanceId: this.instanceId,
++          instanceName: this.instance.name,
++          disconnectReason: statusCode,
++          retryCount: this.reconnectAttempts,
++          backoffMs,
++          generation,
++        });
++        await delay(backoffMs);
++        if (generation !== this.socketGeneration) return;
+         await this.connectToWhatsapp(this.phoneNumber);
+       } else {
+         this.sendDataWebhook(Events.STATUS_INSTANCE, {
+@@ -456,15 +491,34 @@ export class BaileysStartupService extends ChannelStartupService {
+           );
+         }
+ 
+-        this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
++        if (sessionIsInvalid) {
++          this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
++        } else if (connectionWasReplaced) {
++          this.logger.warn({
++            event: 'whatsapp.connection.replaced',
++            instanceId: this.instanceId,
++            instanceName: this.instance.name,
++            disconnectReason: statusCode,
++            generation,
++          });
++        } else {
++          this.logger.error({
++            event: 'whatsapp.reconnect.exhausted',
++            instanceId: this.instanceId,
++            instanceName: this.instance.name,
++            disconnectReason: statusCode,
++            retryCount: this.reconnectAttempts,
++            generation,
++          });
++        }
+         this.client?.ws?.close();
+         this.client.end(new Error('Close connection'));
+-
+         this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+       }
+     }
+ 
+     if (connection === 'open') {
++      this.reconnectAttempts = 0;
+       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
+       try {
+         const profilePic = await this.profilePicture(this.instance.wuid);
+@@ -695,21 +749,23 @@ export class BaileysStartupService extends ChannelStartupService {
+ 
+     this.endSession = false;
+ 
+-    this.client = makeWASocket(socketConfig);
++    const generation = ++this.socketGeneration;
++    const client = makeWASocket(socketConfig);
++    this.client = client;
+ 
+     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
+-      useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
++      useVoiceCallsBaileys(this.localSettings.wavoipToken, client, this.connectionStatus.state as any, true);
+     }
+ 
+-    this.eventHandler();
++    this.eventHandler(client, generation);
+ 
+-    this.client.ws.on('CB:call', (packet) => {
++    client.ws.on('CB:call', (packet) => {
+       console.log('CB:call', packet);
+       const payload = { event: 'CB:call', packet: packet };
+       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
+     });
+ 
+-    this.client.ws.on('CB:ack,class:call', (packet) => {
++    client.ws.on('CB:ack,class:call', (packet) => {
+       console.log('CB:ack,class:call', packet);
+       const payload = { event: 'CB:ack,class:call', packet: packet };
+       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
+@@ -717,31 +773,55 @@ export class BaileysStartupService extends ChannelStartupService {
+ 
+     this.phoneNumber = number;
+ 
+-    return this.client;
++    return client;
+   }
+ 
+   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+-    try {
+-      this.loadChatwoot();
+-      this.loadSettings();
+-      this.loadWebhook();
+-      this.loadProxy();
+-
+-      // Remontar o messageProcessor para garantir que está funcionando após reconexão
+-      this.messageProcessor.mount({
+-        onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
+-      });
++    if (this.connectionAttempt) return this.connectionAttempt;
+ 
+-      return await this.createClient(number);
+-    } catch (error) {
+-      this.logger.error(error);
+-      throw new InternalServerErrorException(error?.toString());
++    const attempt = (async () => {
++      try {
++        this.stateConnection = { state: 'connecting', statusReason: 0 };
++        this.loadChatwoot();
++        this.loadSettings();
++        this.loadWebhook();
++        this.loadProxy();
++
++        // Remontar o messageProcessor para garantir que está funcionando após reconexão
++        this.messageProcessor.mount({
++          onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
++        });
++
++        return await this.createClient(number);
++      } catch (error) {
++        this.stateConnection = {
++          state: 'close',
++          statusReason: (error as Boom)?.output?.statusCode ?? 500,
++        };
++        this.logger.error(error);
++        throw new InternalServerErrorException(error?.toString());
++      }
++    })();
++
++    this.connectionAttempt = attempt;
++    try {
++      return await attempt;
++    } finally {
++      if (this.connectionAttempt === attempt) this.connectionAttempt = undefined;
+     }
+   }
+ 
+   public async reloadConnection(): Promise<WASocket> {
++    if (this.connectionAttempt) return this.connectionAttempt;
++
+     try {
+-      return await this.createClient(this.phoneNumber);
++      const previousClient = this.client;
++      // Invalidate callbacks from the retired socket before closing it. A
++      // connectionReplaced close event must never erase otherwise valid creds.
++      this.socketGeneration += 1;
++      previousClient?.ws?.close();
++      previousClient?.end(new Error('Controlled connection reload'));
++      return await this.connectToWhatsapp(this.phoneNumber);
+     } catch (error) {
+       this.logger.error(error);
+       throw new InternalServerErrorException(error?.toString());
+@@ -1872,10 +1952,11 @@ export class BaileysStartupService extends ChannelStartupService {
+     },
+   };
+ 
+-  private eventHandler() {
+-    this.client.ev.process(async (events) => {
++  private eventHandler(client: WASocket, generation: number) {
++    client.ev.process(async (events) => {
+       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
+         try {
++          if (generation !== this.socketGeneration || client !== this.client) return;
+           if (!this.endSession) {
+             const database = this.configService.get<Database>('DATABASE');
+             const settings = await this.findSettings();
+@@ -1899,12 +1980,12 @@ export class BaileysStartupService extends ChannelStartupService {
+               this.sendDataWebhook(Events.CALL, call);
+             }
+ 
+-            if (events['connection.update']) {
+-              this.connectionUpdate(events['connection.update']);
++            if (events['creds.update']) {
++              await this.instance.authState.saveCreds();
+             }
+ 
+-            if (events['creds.update']) {
+-              this.instance.authState.saveCreds();
++            if (events['connection.update']) {
++              await this.connectionUpdate(events['connection.update'], generation);
+             }
+ 
+             if (events['messaging-history.set']) {
+@@ -4000,7 +4081,7 @@ export class BaileysStartupService extends ChannelStartupService {
+       await this.client.updateLastSeenPrivacy(settings.last);
+       await this.client.updateGroupsAddPrivacy(settings.groupadd);
+ 
+-      this.reloadConnection();
++      await this.reloadConnection();
+ 
+       return {
+         update: 'success',
+@@ -4089,7 +4170,7 @@ export class BaileysStartupService extends ChannelStartupService {
+ 
+       await this.client.updateProfilePicture(this.instance.wuid, pic);
+ 
+-      this.reloadConnection();
++      await this.reloadConnection();
+ 
+       return { update: 'success' };
+     } catch (error) {
+@@ -4101,7 +4182,7 @@ export class BaileysStartupService extends ChannelStartupService {
+     try {
+       await this.client.removeProfilePicture(this.instance.wuid);
+ 
+-      this.reloadConnection();
++      await this.reloadConnection();
+ 
+       return { update: 'success' };
+     } catch (error) {
