@@ -18,8 +18,13 @@ COPY patches/0001-single-flight-whatsapp-lifecycle.patch /tmp/evolution-lifecycl
 RUN git apply --check /tmp/evolution-lifecycle.patch \
     && git apply /tmp/evolution-lifecycle.patch
 
-# Pin the exact reviewed hotfix commit. It adds handling for
-# companion_reg_refresh and keeps the rest of Evolution API on 2.3.7.
+# Override vulnerable transitive fast-xml-parser versions used by AWS SDK/MinIO.
+RUN npm pkg set 'overrides.fast-xml-parser=5.11.1'
+
+# Re-resolve the dependency tree with the security override.
+RUN npm install
+
+# Pin the exact reviewed Baileys hotfix commit.
 RUN npm install --save-exact \
       "baileys@git+https://github.com/doryani-ai/Baileys.git#${BAILEYS_HOTFIX_COMMIT}"
 
@@ -29,7 +34,6 @@ RUN node --input-type=module -e \
 # Block a production image whenever the resolved runtime dependency graph has
 # a critical advisory. This runs after the pinned Git dependency has rewritten
 # the lockfile, so the audit covers the graph that is copied to the final image.
-RUN npm audit fix --omit=dev
 RUN npm audit --omit=dev --audit-level=critical
 
 ENV DOCKER_ENV=true
